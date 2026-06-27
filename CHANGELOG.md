@@ -2,11 +2,14 @@
 
 All notable changes will be documented here. Follows [semantic versioning](https://semver.org): bump MAJOR for breaking changes, MINOR for new features, PATCH for bug fixes.
 
-## [0.1.0] - 2026-06-27
+## [0.2.0] - 2026-06-27
 
 ### Added
-- Initial release
-- 15 tools: `read_file`, `write_file`, `edit_file`, `list_directory`, `create_directory`, `move_file`, `copy_file`, `get_file_info`, `search_files`, `run_command`, `start_process`, `read_process_output`, `write_to_process`, `kill_process`, `list_processes`
-- `SessionStart` hook checking Python 3.9+ and `mcp` package on startup
-- `file-commander-setup` skill for installation guidance and troubleshooting
-- `file-ops-guide` skill for tool selection best practices
+- `read_multiple_files` -- batch-read several files in one call
+- `append_to_file` -- append text without overwriting
+- `delete_file` -- delete files or directories (requires recursive=true for non-empty dirs)
+- `tail_file` -- return last N lines of a file (great for logs)
+- `file_hash` -- compute MD5/SHA1/SHA256/SHA512 checksum of any file
+- `download_file` -- download a file from a URL (no external dependencies)
+- `zip_files` -- create a zip archive from files or folders
+- `un
