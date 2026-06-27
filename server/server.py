@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File Commander MCP Server - v0.2.0
+File Commander MCP Server - v0.2.1
 
 Full-featured local file, shell, SSH, and process access for Windows.
 
@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import html as _html
 import io
+import itertools
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -49,6 +51,15 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("file_commander_mcp")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_MAX_BUF_CHARS  = 5_000_000        # per-process output buffer cap (~5 MB of text)
+_SESSION_TTL    = 600              # seconds before dead process sessions are auto-purged
+_SEARCH_TTL     = 600              # seconds before completed searches are auto-purged
+_MAX_READ_BYTES = 50 * 1024 * 1024 # read_file refuses files larger than 50 MB
 
 # ---------------------------------------------------------------------------
 # Process session store
@@ -74,6 +85,11 @@ class _Session:
         for line in stream:
             with self._lock:
                 self._buf.write(line)
+                # Cap buffer to prevent unbounded memory growth from verbose processes
+                if self._buf.tell() > _MAX_BUF_CHARS:
+                    overflow = self._buf.getvalue()
+                    self._buf = io.StringIO("[...output truncated...]\n" + overflow[-(_MAX_BUF_CHARS // 2):])
+                    self._buf.seek(0, 2)
 
     def read_output(self) -> str:
         with self._lock:
@@ -91,13 +107,11 @@ class _Session:
 
 
 _SESSIONS: Dict[str, _Session] = {}
-_SESSION_COUNTER = 0
+_SESSION_IDS = itertools.count(1)
 
 
 def _new_session_id() -> str:
-    global _SESSION_COUNTER
-    _SESSION_COUNTER += 1
-    return f"proc_{_SESSION_COUNTER}"
+    return f"proc_{next(_SESSION_IDS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +119,11 @@ def _new_session_id() -> str:
 # ---------------------------------------------------------------------------
 
 _SSH_SESSIONS: Dict[str, Any] = {}
-_SSH_COUNTER = 0
+_SSH_IDS = itertools.count(1)
 
 
 def _new_ssh_id() -> str:
-    global _SSH_COUNTER
-    _SSH_COUNTER += 1
-    return f"ssh_{_SSH_COUNTER}"
+    return f"ssh_{next(_SSH_IDS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +161,11 @@ class _SearchJob:
 
 
 _SEARCHES: Dict[str, _SearchJob] = {}
-_SEARCH_COUNTER = 0
+_SEARCH_IDS = itertools.count(1)
 
 
 def _new_search_id() -> str:
-    global _SEARCH_COUNTER
-    _SEARCH_COUNTER += 1
-    return f"search_{_SEARCH_COUNTER}"
+    return f"search_{next(_SEARCH_IDS)}"
 
 
 def _run_search_job(job: _SearchJob):
@@ -189,6 +199,27 @@ def _run_search_job(job: _SearchJob):
         job.error = f"{type(exc).__name__}: {exc}"
     finally:
         job.done = True
+
+
+# ---------------------------------------------------------------------------
+# Background cleanup — purges dead processes and completed searches after TTL
+# ---------------------------------------------------------------------------
+
+def _cleanup_loop():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        dead_procs = [sid for sid, s in list(_SESSIONS.items())
+                      if not s.running and (now - s.started) > _SESSION_TTL]
+        for sid in dead_procs:
+            _SESSIONS.pop(sid, None)
+        old_searches = [sid for sid, j in list(_SEARCHES.items())
+                        if j.done and (now - j.started) > _SEARCH_TTL]
+        for sid in old_searches:
+            _SEARCHES.pop(sid, None)
+
+
+threading.Thread(target=_cleanup_loop, daemon=True, name="fc-cleanup").start()
 
 
 # ---------------------------------------------------------------------------
@@ -327,9 +358,10 @@ class HashFileInput(BaseModel):
 
 class DownloadFileInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    url: str = Field(..., description="URL to download from")
+    url: str = Field(..., description="URL to download from (must be http:// or https://)")
     destination: str = Field(..., description="Absolute Windows path to save the downloaded file")
     timeout: int = Field(default=60, description="Download timeout in seconds", ge=1, le=600)
+    max_mb: int = Field(default=500, description="Maximum file size to download in MB", ge=1, le=10000)
 
 
 class ZipInput(BaseModel):
@@ -456,8 +488,14 @@ async def read_file(params: PathInput) -> str:
             return _err(f"File not found: {params.path}")
         if not p.is_file():
             return _err(f"Path is a directory, not a file: {params.path}")
+        size = p.stat().st_size
+        if size > _MAX_READ_BYTES:
+            return _err(
+                f"File too large to read as text ({size // (1024 * 1024)} MB). "
+                "Use tail_file to read the end, or read a specific section."
+            )
         content = p.read_text(encoding="utf-8", errors="replace")
-        return _ok({"content": content, "size_bytes": p.stat().st_size})
+        return _ok({"content": content, "size_bytes": size})
     except PermissionError:
         return _err(f"Permission denied: {params.path}")
     except Exception as e:
@@ -766,11 +804,20 @@ async def copy_file(params: SrcDstInput) -> str:
         dst = _p(params.dst)
         if not src.exists():
             return _err(f"Source not found: {params.src}")
-        if not src.is_file():
-            return _err(f"Source is not a file: {params.src}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        final = shutil.copy2(src, dst)
-        return _ok({"success": True, "source": str(src), "destination": str(final)})
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            final = shutil.copy2(src, dst)
+            return _ok({"success": True, "source": str(src), "destination": str(final), "type": "file"})
+        if src.is_dir():
+            if dst.exists():
+                return _err(
+                    f"Destination already exists: {params.dst}. "
+                    "Remove it first or choose a different path."
+                )
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            final = shutil.copytree(str(src), str(dst))
+            return _ok({"success": True, "source": str(src), "destination": str(final), "type": "directory"})
+        return _err(f"Unknown path type: {params.src}")
     except PermissionError:
         return _err(f"Permission denied: {params.src} -> {params.dst}")
     except Exception as e:
@@ -852,15 +899,37 @@ async def download_file(params: DownloadFileInput) -> str:
         JSON: {success, url, destination, size_bytes} or {error}.
     """
     _track("download_file")
+    parsed = urllib.parse.urlparse(params.url)
+    if parsed.scheme not in ("http", "https"):
+        return _err(f"Unsupported URL scheme '{parsed.scheme}'. Only http and https are allowed.")
     try:
         dst = _p(params.destination)
         dst.parent.mkdir(parents=True, exist_ok=True)
+        max_bytes = params.max_mb * 1024 * 1024
         loop = asyncio.get_running_loop()
 
         def _download():
             req = urllib.request.Request(params.url, headers={"User-Agent": "File-Commander/0.2"})
-            with urllib.request.urlopen(req, timeout=params.timeout) as resp, dst.open("wb") as fh:
-                shutil.copyfileobj(resp, fh)
+            with urllib.request.urlopen(req, timeout=params.timeout) as resp:
+                cl = resp.headers.get("Content-Length")
+                if cl and int(cl) > max_bytes:
+                    raise ValueError(
+                        f"File too large: server reports {int(cl) // (1024 * 1024)} MB, "
+                        f"limit is {params.max_mb} MB."
+                    )
+                downloaded = 0
+                with dst.open("wb") as fh:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            dst.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"Download exceeded size limit of {params.max_mb} MB."
+                            )
+                        fh.write(chunk)
 
         await loop.run_in_executor(None, _download)
         return _ok({
@@ -869,6 +938,8 @@ async def download_file(params: DownloadFileInput) -> str:
             "destination": str(dst),
             "size_bytes": dst.stat().st_size,
         })
+    except ValueError as e:
+        return _err(str(e))
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}")
 
@@ -1092,13 +1163,15 @@ async def get_more_search_results(params: SearchPageInput) -> str:
         return _err(f"Search not found: {params.search_id}. Use list_searches to see active searches.")
     job = _SEARCHES[params.search_id]
     page = job.next_page(params.page_size)
+    with job._lock:
+        remaining = len(job.results) - job._page_offset
     return _ok({
         "search_id": params.search_id,
         "results": page,
         "results_in_page": len(page),
         "total_so_far": job.total_so_far,
         "done": job.done,
-        "has_more": not job.done or len(page) == params.page_size,
+        "has_more": not job.done or remaining > 0,
         "error": job.error,
     })
 
@@ -1567,6 +1640,7 @@ async def get_config(params: ConfigKeyInput) -> str:
         return _ok({"key": params.key, "value": cfg[params.key], "set": True})
     except Exception as e:
         return _err(f"{type(e).__name__}: {e}")
+
 
 
 @mcp.tool(name="set_config_value", annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})
