@@ -38,12 +38,12 @@ Gives Claude direct access to your Windows filesystem and shell: read, write, ed
 
 Just talk to Claude naturally — the tools activate automatically:
 
-- *"Read `C:\Users\Alber\project\main.py` and find the bug in the parse function"*
-- *"Edit `sermon_database.csv` — replace the header `title` with `sermon_title`"*
+- *"Read `C:\Users\YourName\project\main.py` and find the bug in the parse function"*
+- *"Edit `data.csv` — replace the header `title` with `sermon_title`"*
 - *"Search `C:\project` for any `.py` file that contains `def process_audio`"*
-- *"Run `python main.py` in `C:\Users\Alber\sermon-processor` and show me the output"*
+- *"Run `python main.py` in `C:\project` and show me the output"*
 - *"Start a local server with `python -m http.server 8000` and keep it running"*
-- *"List everything in `C:\Users\Alber\project` recursively"*
+- *"List everything in `C:\Users\YourName\project` recursively"*
 
 ## Using on multiple computers
 
