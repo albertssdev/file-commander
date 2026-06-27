@@ -1,6 +1,6 @@
 {
   "name": "file-commander",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "37 tools for reliable Windows file and shell access: read, write, edit, search, hash, zip, download files; run commands; SSH into remote machines; manage persistent background processes; create PDFs; track config. No connection drops, no cloud dependency. Requires Python 3.9+ and pip install mcp[cli]. Works on any Windows machine.",
   "author": {"name": "Samuel Alberts"},
   "homepage": "https://github.com/albertssdev/file-commander",
