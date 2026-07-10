@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python -c \"import sys, importlib.util, json; ok=sys.version_info>=(3,9); mcp=importlib.util.find_spec('mcp') is not None; msgs=[]; (not ok) and msgs.append(f'Python 3.9+ required (found {sys.version.split()[0]}) - upgrade at https://python.org'); (not mcp) and msgs.append('mcp package missing - run: pip install mcp[cli]'); out={'decision':'approve','reason':'WARNING - File Commander prerequisites not met: '+' | '.join(msgs)} if msgs else {'decision':'approve'}; print(json.dumps(out))\"",
+          "command": "python -c \"import sys, json; ok=sys.version_info>=(3,9); out={'decision':'approve','reason':f'WARNING - File Commander requires Python 3.9+ (found {sys.version.split()[0]}) - upgrade at https://python.org'} if not ok else {'decision':'approve'}; print(json.dumps(out))\"",
           "timeout": 10
         }
       ]

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-File Commander MCP Server - v0.2.1
+File Commander MCP Server - v0.3.0
 
 Full-featured local file, shell, SSH, and process access for Windows.
+
+This server has ZERO third-party dependencies. It speaks the MCP protocol
+(JSON-RPC 2.0 over stdio) using only the Python standard library -- no
+`pip install mcp[cli]`, no pydantic, nothing to install beyond Python itself.
+(SSH support still needs `pip install paramiko` and PDF export still needs
+`pip install reportlab`, since those genuinely need third-party libraries --
+everything else works out of the box.)
 
 Tools:
   File I/O       -- read_file, read_multiple_files, write_file, append_to_file,
@@ -26,10 +33,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html as _html
+import inspect
 import io
 import itertools
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -41,16 +50,390 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Optional, Union, get_args, get_origin, get_type_hints
 
 # ---------------------------------------------------------------------------
-# Server init
+# Local mini MCP framework
+#
+# Replaces `mcp.server.fastmcp.FastMCP` + `pydantic` with a small, dependency-
+# free stand-in. It only implements the subset of behavior the Input models
+# and tool definitions below actually use:
+#   - Field(...)/Field(default=..., description=..., ge=..., le=...)
+#   - BaseModel subclasses with str / bool / int / Optional[str] / List[str]
+#     fields, extra="forbid", str_strip_whitespace=True (hardcoded -- every
+#     model below uses that same config)
+#   - A tool registry + JSON-RPC 2.0 stdio transport (newline-delimited,
+#     matching the framing used by the official MCP SDK's stdio_server())
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("file_commander_mcp")
+
+class ValidationError(ValueError):
+    """Raised when tool call arguments fail validation. Reported back to the
+    client as a normal tool error (isError=true), never as a crash."""
+
+
+class _FieldInfo:
+    __slots__ = ("default", "required", "description", "ge", "le")
+
+    def __init__(self, default: Any, description: str, ge: Optional[int], le: Optional[int]):
+        self.required = default is ...
+        self.default = None if self.required else default
+        self.description = description
+        self.ge = ge
+        self.le = le
+
+
+def Field(default: Any = ..., *, description: str = "", ge: Optional[int] = None, le: Optional[int] = None) -> _FieldInfo:
+    """Minimal stand-in for pydantic.Field. `Field(...)` (Ellipsis, pydantic's own
+    convention) means required; `Field(default=X, ...)` means optional with default X."""
+    return _FieldInfo(default, description, ge, le)
+
+
+def ConfigDict(**kwargs: Any) -> dict:
+    """Stand-in for pydantic.ConfigDict. Every Input model below uses the same
+    config (str_strip_whitespace=True, extra="forbid"), which BaseModel.parse()
+    applies unconditionally -- this just needs to exist so `model_config = ConfigDict(...)`
+    doesn't error."""
+    return dict(kwargs)
+
+
+def _describe_type(tp: Any):
+    """Returns (json_type, optional, is_list) for the handful of type shapes used
+    by the Input models below: str, bool, int, Optional[str], List[str]."""
+    origin = get_origin(tp)
+    if origin is list:
+        return "array", False, True
+    if origin is Union:
+        args = get_args(tp)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1 and type(None) in args:
+            inner_kind, _inner_opt, inner_list = _describe_type(non_none[0])
+            return inner_kind, True, inner_list
+    if tp is bool:
+        return "boolean", False, False
+    if tp is int:
+        return "integer", False, False
+    return "string", False, False
+
+
+def _coerce(field_name: str, value: Any, ftype: Any, finfo: _FieldInfo) -> Any:
+    kind, optional, is_list = _describe_type(ftype)
+
+    if value is None:
+        if optional:
+            return None
+        raise ValidationError(f"'{field_name}' must not be null")
+
+    if is_list:
+        if not isinstance(value, list):
+            raise ValidationError(f"'{field_name}' must be an array of strings")
+        return [v.strip() if isinstance(v, str) else str(v) for v in value]
+
+    if kind == "string":
+        return value.strip() if isinstance(value, str) else str(value)
+
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        if isinstance(value, (int, float)):
+            return bool(value)
+        raise ValidationError(f"'{field_name}' must be a boolean")
+
+    if kind == "integer":
+        if isinstance(value, bool):
+            raise ValidationError(f"'{field_name}' must be an integer")
+        if isinstance(value, int):
+            n = value
+        elif isinstance(value, float) and value.is_integer():
+            n = int(value)
+        elif isinstance(value, str):
+            try:
+                n = int(value.strip())
+            except ValueError:
+                raise ValidationError(f"'{field_name}' must be an integer")
+        else:
+            raise ValidationError(f"'{field_name}' must be an integer")
+        if finfo.ge is not None and n < finfo.ge:
+            raise ValidationError(f"'{field_name}' must be >= {finfo.ge}")
+        if finfo.le is not None and n > finfo.le:
+            raise ValidationError(f"'{field_name}' must be <= {finfo.le}")
+        return n
+
+    return value
+
+
+class BaseModel:
+    """Minimal stand-in for pydantic.BaseModel. Validates/coerces a plain dict of
+    JSON-decoded tool arguments into an attribute-access object (so existing
+    `params.path`-style code keeps working unchanged), and can describe itself
+    as a JSON Schema for the tools/list response."""
+
+    # Deliberately unannotated (a type hint here would make get_type_hints()
+    # -- which walks the whole MRO -- treat these as inherited "fields" on
+    # every subclass, since it aggregates __annotations__ across base classes).
+    _fc_fields = {}
+    _fc_types = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        hints = get_type_hints(cls)
+        fields: Dict[str, _FieldInfo] = {}
+        types_: Dict[str, Any] = {}
+        for fname, ftype in hints.items():
+            if fname == "model_config" or fname.startswith("_"):
+                continue
+            raw_default = cls.__dict__.get(fname, ...)
+            finfo = raw_default if isinstance(raw_default, _FieldInfo) else _FieldInfo(raw_default, "", None, None)
+            fields[fname] = finfo
+            types_[fname] = ftype
+        cls._fc_fields = fields
+        cls._fc_types = types_
+
+    @classmethod
+    def parse(cls, arguments: Optional[dict]) -> "BaseModel":
+        arguments = arguments or {}
+        unknown = set(arguments) - set(cls._fc_fields)
+        if unknown:
+            raise ValidationError(f"Unexpected argument(s): {', '.join(sorted(unknown))}")
+        obj = cls.__new__(cls)
+        for fname, finfo in cls._fc_fields.items():
+            if fname in arguments:
+                value = _coerce(fname, arguments[fname], cls._fc_types[fname], finfo)
+            elif finfo.required:
+                raise ValidationError(f"Missing required argument: '{fname}'")
+            else:
+                value = finfo.default
+            setattr(obj, fname, value)
+        return obj
+
+    @classmethod
+    def schema(cls) -> dict:
+        properties: Dict[str, Any] = {}
+        required: List[str] = []
+        for fname, finfo in cls._fc_fields.items():
+            kind, _optional, is_list = _describe_type(cls._fc_types[fname])
+            prop: Dict[str, Any] = {"type": kind}
+            if is_list:
+                prop["items"] = {"type": "string"}
+            if finfo.description:
+                prop["description"] = finfo.description
+            if not finfo.required:
+                prop["default"] = finfo.default
+            if finfo.ge is not None:
+                prop["minimum"] = finfo.ge
+            if finfo.le is not None:
+                prop["maximum"] = finfo.le
+            properties[fname] = prop
+            if finfo.required:
+                required.append(fname)
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+
+TOOLS: Dict[str, dict] = {}
+
+
+def _tool_input_model(func) -> Optional[type]:
+    sig = inspect.signature(func)
+    params = list(sig.parameters.values())
+    if not params:
+        return None
+    hints = get_type_hints(func)
+    return hints.get(params[0].name)
+
+
+class _MCPServer:
+    """Minimal stand-in for mcp.server.fastmcp.FastMCP: registers tools via the
+    same `@mcp.tool(name=..., annotations=...)` decorator syntax, then serves
+    them over a pure standard-library MCP stdio transport."""
+
+    def __init__(self, name: str, version: str = "0.3.0"):
+        self.name = name
+        self.version = version
+
+    def tool(self, *, name: str, annotations: Optional[dict] = None):
+        def decorator(func):
+            TOOLS[name] = {
+                "func": func,
+                "description": inspect.getdoc(func) or "",
+                "annotations": annotations or {},
+                "model": _tool_input_model(func),
+            }
+            return func
+
+        return decorator
+
+    def run(self) -> None:
+        _serve_stdio(self.name, self.version)
+
+
+mcp = _MCPServer("file_commander_mcp")
+
+# ---------------------------------------------------------------------------
+# JSON-RPC 2.0 stdio transport
+# ---------------------------------------------------------------------------
+
+_NO_ID = object()  # sentinel: distinguishes "no id key" (notification) from "id: null"
+
+
+def _handle_initialize(params: dict, server_name: str, server_version: str) -> dict:
+    client_version = params.get("protocolVersion") if isinstance(params, dict) else None
+    return {
+        "protocolVersion": client_version or "2025-06-18",
+        "capabilities": {"tools": {"listChanged": False}},
+        "serverInfo": {"name": server_name, "version": server_version},
+    }
+
+
+def _tools_list_result() -> dict:
+    tools = []
+    for tool_name, entry in TOOLS.items():
+        model = entry["model"]
+        schema = (
+            model.schema()
+            if model is not None
+            else {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+        )
+        tool_obj: Dict[str, Any] = {
+            "name": tool_name,
+            "description": entry["description"],
+            "inputSchema": schema,
+        }
+        if entry["annotations"]:
+            tool_obj["annotations"] = entry["annotations"]
+        tools.append(tool_obj)
+    return {"tools": tools}
+
+
+async def _handle_tools_call(params: dict) -> dict:
+    name = (params or {}).get("name")
+    arguments = (params or {}).get("arguments") or {}
+    entry = TOOLS.get(name)
+    if entry is None:
+        return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+
+    model = entry["model"]
+    func = entry["func"]
+    try:
+        if model is not None:
+            bound = model.parse(arguments)
+            result = await func(bound)
+        else:
+            if arguments:
+                extra = ", ".join(sorted(arguments.keys()))
+                return {"content": [{"type": "text", "text": f"Unexpected argument(s): {extra}"}], "isError": True}
+            result = await func()
+    except ValidationError as exc:
+        return {"content": [{"type": "text", "text": f"Input validation error: {exc}"}], "isError": True}
+    except Exception as exc:
+        return {"content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}], "isError": True}
+
+    return {"content": [{"type": "text", "text": result}], "isError": False}
+
+
+def _serve_stdio(server_name: str, server_version: str) -> None:
+    """Speaks MCP over stdio: newline-delimited JSON-RPC 2.0 messages, UTF-8, no
+    Content-Length framing -- the same wire format used by the official MCP
+    SDK's `stdio_server()`. Only stdout carries protocol traffic; nothing else
+    may ever be written there or it corrupts the stream (all diagnostics go to
+    stderr, and there is no logging/printing anywhere else in this file).
+
+    Requests are handled one at a time, in the order received: a background
+    thread reads lines off stdin into a queue (avoids asyncio's flaky stdin-pipe
+    support on Windows), and the main thread drains that queue, running each
+    tools/call through a single persistent asyncio event loop so the existing
+    `asyncio.get_running_loop()` / `run_in_executor` calls inside the tool
+    implementations keep working unchanged.
+    """
+    stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+    line_queue: "queue.Queue" = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for raw_line in stdin:
+                line_queue.put(raw_line)
+        finally:
+            line_queue.put(None)  # sentinel: stdin closed
+
+    threading.Thread(target=_reader, daemon=True, name="fc-stdin-reader").start()
+
+    def _send(obj: dict) -> None:
+        stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        stdout.flush()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        while True:
+            raw_line = line_queue.get()
+            if raw_line is None:
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                continue
+
+            method = msg.get("method")
+            if method is None:
+                continue  # a response or malformed message -- nothing for a server to do with it
+
+            msg_id = msg.get("id", _NO_ID)
+            is_request = msg_id is not _NO_ID
+            params = msg.get("params") or {}
+
+            try:
+                if method == "initialize":
+                    result = _handle_initialize(params, server_name, server_version)
+                elif method == "notifications/initialized":
+                    continue
+                elif method == "ping":
+                    result = {}
+                elif method == "tools/list":
+                    result = _tools_list_result()
+                elif method == "tools/call":
+                    result = loop.run_until_complete(_handle_tools_call(params))
+                elif method.startswith("notifications/"):
+                    continue  # e.g. notifications/cancelled -- nothing to cancel here
+                else:
+                    if is_request:
+                        _send(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": msg_id,
+                                "error": {"code": -32601, "message": f"Method not found: {method}"},
+                            }
+                        )
+                    continue
+            except Exception as exc:  # last-resort safety net -- never let one bad request kill the server
+                if is_request:
+                    _send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {"code": -32603, "message": f"Internal error: {type(exc).__name__}: {exc}"},
+                        }
+                    )
+                continue
+
+            if is_request:
+                _send({"jsonrpc": "2.0", "id": msg_id, "result": result})
+    finally:
+        loop.close()
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -909,7 +1292,7 @@ async def download_file(params: DownloadFileInput) -> str:
         loop = asyncio.get_running_loop()
 
         def _download():
-            req = urllib.request.Request(params.url, headers={"User-Agent": "File-Commander/0.2"})
+            req = urllib.request.Request(params.url, headers={"User-Agent": "File-Commander/0.3"})
             with urllib.request.urlopen(req, timeout=params.timeout) as resp:
                 cl = resp.headers.get("Content-Length")
                 if cl and int(cl) > max_bytes:
